@@ -1,14 +1,11 @@
 /* Inference for Llama-3 Transformer model in pure C */
 
 #include <ctype.h>
-#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sys/mman.h>
-#include <unistd.h>
 #include <stdbool.h>
 
 // ----------------------------------------------------------------------------
@@ -72,10 +69,9 @@ typedef struct {
   Config config;              // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
   RunState state;             // buffers for the "wave" of activations in the forward pass
-  // some more state needed to properly clean up the memory mapping (sigh)
-  int fd;            // file descriptor for memory mapping
-  float *data;       // memory mapped data pointer
-  ssize_t file_size; // size of the checkpoint file in bytes
+  // memory for model data (replaces memory mapping)
+  float *data;       // allocated data pointer for model weights
+  size_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
 void malloc_run_state(RunState *s, Config *p) {
@@ -183,7 +179,7 @@ void memory_map_weights(TransformerWeights *w, Config *p, float *ptr, int shared
   w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
-void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weights, int *fd, float **data, ssize_t *file_size) {
+void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weights, float **data, size_t *file_size) {
   FILE *file = fopen(checkpoint, "rb");
   if (!file) {
     fprintf(stderr, "Couldn't open file %s, it may not exist.\n", checkpoint);
@@ -198,42 +194,46 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   config->vocab_size = abs(config->vocab_size);
   // figure out the file size
 #if defined _WIN32
-  _fseeki64(file, 0, SEEK_END); // move file pointer to end of file
-  *file_size = _ftelli64(file); // get the file size, in bytes
+  fseek(file, 0, SEEK_END); // move file pointer to end of file
+  *file_size = ftell(file); // get the file size, in bytes
 #else
   fseek(file, 0, SEEK_END); // move file pointer to end of file
   *file_size = ftell(file); // get the file size, in bytes
 #endif
+  
+  // allocate memory for the entire file
+  *data = (float*)malloc(*file_size);
+  if (*data == NULL) {
+    fprintf(stderr, "malloc failed for file size %zu!\n", *file_size);
+    fclose(file);
+    exit(EXIT_FAILURE);
+  }
+  
+  // seek back to beginning and read the entire file
+  fseek(file, 0, SEEK_SET);
+  if (fread(*data, 1, *file_size, file) != *file_size) {
+    fprintf(stderr, "failed to read entire file!\n");
+    free(*data);
+    fclose(file);
+    exit(EXIT_FAILURE);
+  }
   fclose(file);
-  // memory map the Transformer weights into the data pointer
-  *fd = open(checkpoint, O_RDONLY); // open in read only mode
-  if (*fd == -1) {
-    fprintf(stderr, "open failed!\n");
-    exit(EXIT_FAILURE);
-  }
-  *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-  if (*data == MAP_FAILED) {
-    fprintf(stderr, "mmap failed!\n");
-    exit(EXIT_FAILURE);
-  }
+  
   float *weights_ptr = *data + sizeof(Config) / sizeof(float);
-  memory_map_weights(weights, config, weights_ptr, shared_weights,true);
+  memory_map_weights(weights, config, weights_ptr, shared_weights, true);
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path){
   // read in the Config and the Weights from the checkpoint
-  read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+  read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->data, &t->file_size);
   // allocate the RunState buffers
   malloc_run_state(&t->state, &t->config);
 }
 
 void free_transformer(Transformer *t) {
-  // close the memory mapping
-  if (t->data != MAP_FAILED) {
-    munmap(t->data, t->file_size);
-  }
-  if (t->fd != -1) {
-    close(t->fd);
+  // free the allocated memory
+  if (t->data != NULL) {
+    free(t->data);
   }
   // free the RunState buffers
   free_run_state(&t->state);
